@@ -1,0 +1,24 @@
+services:
+  cidr-api:
+    build: .
+    image: cidr-allocation-api:latest
+    container_name: cidr-allocation-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 地址池配置：父网段与保留子网（逗号分隔，可留空）
+      PARENT_CIDR: "10.0.0.0/8"
+      RESERVED_CIDRS: "10.255.255.0/24,10.0.0.0/16"
+      DB_PATH: "/data/cidr_pool.db"
+    volumes:
+      - cidr-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  cidr-data:
