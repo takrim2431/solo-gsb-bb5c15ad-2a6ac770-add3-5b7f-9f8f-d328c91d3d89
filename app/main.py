@@ -1,4 +1,4 @@
-"""FastAPI 接口：池状态查询、预演与原子提交、部分回收、整批迁移与保留区替换。"""
+"""FastAPI 接口：池状态/历史版本查询、预演与原子提交、部分回收、整批迁移与保留区替换。"""
 from __future__ import annotations
 
 import ipaddress
@@ -277,6 +277,30 @@ def healthz() -> dict[str, str]:
 def get_pool(db: Database = Depends(get_db)) -> PoolInfo:
     """返回当前地址池配置、版本与剩余空闲 CIDR。"""
     return _pool_info(db.get_state())
+
+
+@app.get(
+    "/api/pool/versions/{version}",
+    response_model=PoolInfo,
+    tags=["pool"],
+)
+def get_pool_version(
+    version: int, db: Database = Depends(get_db)
+) -> PoolInfo:
+    """查询**历史版本**的池状态快照。
+
+    返回该版本保存时的父网段、保留与已分配 CIDR，以及依据该快照计算
+    的空闲 CIDR。快照只追加、从不更新：旧版本的状态不随后续写入变化。
+    数据库首次升级时会给当前池版本补存基线快照，此后每次成功的提交 /
+    回收 / 迁移 / 保留区替换都会在各自写事务内生成新版本快照；失败的
+    操作不生成版本。未知版本（含基线之前不存在的版本号）返回 404。
+    """
+    state = db.get_state_version(version)
+    if state is None:
+        raise HTTPException(
+            status_code=404, detail=f"unknown pool version: {version}"
+        )
+    return _pool_info(state)
 
 
 @app.post(

@@ -15,6 +15,8 @@
 
 整批迁移接口一次接收 **1～8 组 `from_cidr`/`to_cidr`**，把多段已分配地址**按整批同时迁移的结果**搬到新位置：两端必须是规范 CIDR、地址族与前缀长度相同，各来源之间、各目标之间不得重叠；每个来源必须被当前已分配地址完整覆盖，目标可使用本批来源释放的地址（支持两组目标互换、链式迁移、原地迁移），但不得触及保留区或未迁移的已分配地址。迁移后把剩余已分配地址与目标地址合并重写为最少的规范 CIDR，版本检查、覆盖与冲突复核、重写及版本自增在单个 SQLite 写事务内完成；输入非法返回 `422 Unprocessable Entity`，状态冲突返回 `409 Conflict` 且池与版本不变。
 
+**历史版本**：数据库首次升级时会给当前池版本补存一份**基线快照**；此后仅在分配提交、部分回收、整批迁移、保留区替换**成功**时，于各自写事务内为自增后的新版本保存该版本的父网段、保留与已分配 CIDR（失败操作整体回滚，不生成版本）。`GET /api/pool/versions/{version}` 返回指定版本的上述状态及据此计算的空闲 CIDR，未知版本返回 `404 Not Found`；快照只追加、从不更新，旧版本状态不随后续写入变化。
+
 ---
 
 ## 一条命令启动
@@ -26,10 +28,10 @@ docker compose up --build -d
 该命令会一次性完成：
 
 - 构建镜像并安装全部 Python 依赖；
-- 初始化 SQLite 数据库（建表、写入父网段与保留子网）；
+- 初始化 SQLite 数据库（建表、写入父网段与保留子网、为初始池版本保存基线快照）；
 - 启动 API 服务。
 
-> 数据库与依赖初始化均随 `docker compose up --build` 自动完成，无需任何手动迁移步骤。数据持久化在命名卷 `cidr-data`（容器内 `/data`）。
+> 数据库与依赖初始化均随 `docker compose up --build` 自动完成，无需任何手动迁移步骤。数据持久化在命名卷 `cidr-data`（容器内 `/data`）。**旧版数据库首次升级**时会自动创建版本快照表并为当前池版本补存一份基线快照（幂等，可重复重启）；该版本之前的历史不存在，按未知版本返回 404。
 
 服务地址与端口：
 
@@ -71,6 +73,7 @@ docker compose down -v         # 同时删除数据卷（彻底重置）
 | --- | --- | --- |
 | GET | `/healthz` | 健康检查 |
 | GET | `/api/pool` | 查询池状态：父网段、版本、保留/已分配子网、当前空闲 CIDR |
+| GET | `/api/pool/versions/{version}` | 查询**历史版本**快照：该版本的父网段、保留/已分配子网与据此计算的空闲 CIDR，未知版本 404 |
 | POST | `/api/allocations/preview` | **预演**：不修改状态，返回池版本与最优方案 |
 | POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库或返回 409 |
 | POST | `/api/allocations/reclaim` | **部分回收**：回收完全被已分配地址覆盖的规范 CIDR |
@@ -94,7 +97,32 @@ curl http://localhost:8000/api/pool
 }
 ```
 
-### 2. 预演分配
+### 2. 查询历史版本快照
+
+每个池版本在生成时都会保存一份**不可变快照**：数据库首次升级时给当前池版本补存基线；此后仅在分配提交、部分回收、整批迁移、保留区替换**成功**时于各自写事务内为新版本保存父网段、保留与已分配 CIDR（失败操作整体回滚，不生成版本）。
+
+```bash
+curl http://localhost:8000/api/pool/versions/3
+```
+
+响应结构与 `GET /api/pool` 完全相同，但内容取自该版本保存时的快照，`free_cidrs` / `free_cidr_count` 依据该版本的保留与已分配 CIDR 当场计算：
+
+```json
+{
+  "parent_cidr": "10.0.0.0/8",
+  "version": 3,
+  "reserved_cidrs": ["10.0.0.0/16", "10.255.255.0/24"],
+  "allocated_cidrs": ["10.1.0.0/24"],
+  "free_cidrs": ["10.1.1.0/24", "..."],
+  "free_cidr_count": 5
+}
+```
+
+- 快照**只追加、从不更新**：即使后续替换了保留区或回收了已分配地址，旧版本返回的仍是它生成时的状态，`free_cidrs` 也按旧快照计算；
+- 版本号必须是正整数：`GET /api/pool/versions/abc` 返回 `422 Unprocessable Entity`；
+- 查询不存在的版本（基线之前的版本、尚未产生的未来版本、0 或负数）返回 `404 Not Found`，响应体 `detail` 说明版本未知。
+
+### 3. 预演分配
 
 请求体 `prefix_lengths` 为 1～8 个前缀长度，**顺序即请求顺序**。
 
@@ -131,7 +159,7 @@ curl -X POST http://localhost:8000/api/allocations/preview \
 
 参数非法（空列表、超过 8 个、前缀越界等）返回 `422 Unprocessable Entity`。
 
-### 3. 提交分配（原子）
+### 4. 提交分配（原子）
 
 把预演返回的版本号与方案原样提交：
 
@@ -161,7 +189,7 @@ curl -X POST http://localhost:8000/api/allocations/commit \
 
 典型工作流：**先 preview 拿到 `pool_version` + `allocations`，再原样 commit**；若收到 409，则重新 preview 后重试。
 
-### 4. 回收已分配地址（部分回收，原子）
+### 5. 回收已分配地址（部分回收，原子）
 
 把当前池版本与一个**规范 CIDR** 提交到回收接口。该 CIDR 必须**完全由当前已分配地址覆盖**——可以恰好是一条分配记录，也可以跨越相邻的多条记录（例如两个相邻 `/25` 合成的 `/24`），也可以只覆盖某条记录的一部分。
 
@@ -201,7 +229,7 @@ CIDR 写法非规范（如主机位非零的 `10.1.0.1/24` 或无法解析）返
 
 > 回收不要求目标与既有分配记录的边界对齐，但目标本身必须是规范 CIDR；扣除后系统会重新规范化全部已分配地址，因此回收后 `allocated_cidrs` 里的记录集合可能与回收前完全不同（数目通常更少），其覆盖的地址集合则严格等于“原已分配集合减去目标”。
 
-### 5. 整批迁移已分配地址（同时迁移，原子）
+### 6. 整批迁移已分配地址（同时迁移，原子）
 
 把当前池版本与 **1～8 组** `from_cidr`/`to_cidr` 提交到迁移接口，系统按**整批同时迁移**的结果一次性完成搬运：每段来源被释放、每个目标被占用。
 
@@ -258,7 +286,7 @@ curl -X POST http://localhost:8000/api/allocations/relocate \
 
 输入非法时返回 `422 Unprocessable Entity`：组数为空或超过 8 个、CIDR 无法解析或写法非规范（如主机位非零的 `10.10.254.1/25`）、同组两端地址族或前缀长度不一致、来源之间或目标之间相互重叠、来源或目标越出父网段（含父网段的超网）或地址族与父网段不一致。
 
-### 6. 替换保留地址（整体替换，原子）
+### 7. 替换保留地址（整体替换，原子）
 
 把当前池版本与保留地址的**完整目标集合** `desired_cidrs` 提交到替换接口。目标集合允许为**空列表**（清空全部保留地址），也允许网段之间**重叠、包含或相邻**；落库时系统会合并相交/相邻区间，规范化为**覆盖范围相同且数量最少**的规范 CIDR 后整体重写保留记录。
 
@@ -333,6 +361,14 @@ curl -X POST http://localhost:8000/api/pool/reservations/replace \
   互斥，同一版本并发写时**恰有一个**成功。迁移响应中的已分配/空闲 CIDR
   同样在本写事务内部读取，提交后的 `GET /api/pool` 与预演立即基于新版本
   与迁移后的占用集计算。
+- **历史版本快照与成功写入同生共死**：四类写操作均在“重写状态 → 版本
+  自增 → 事务内读回新状态”之后、`COMMIT` 之前，把新版本的父网段、保留
+  与已分配 CIDR 追加写入快照表；快照插入失败同样触发整体回滚，因此
+  **失败的操作不生成任何版本**，而成功提交的版本必然有一份与该次写入
+  严格对应的快照。快照表对应用层只追加、从不更新或删除，`GET
+  /api/pool/versions/{version}` 只读取快照表并据其内容重算空闲 CIDR，
+  故旧版本状态**不随后续写入变化**。旧库首次升级时在初始化阶段（
+  `_init_lock` 保护、独立事务）给当前版本补存基线，补存动作幂等。
 
 ---
 
@@ -352,6 +388,7 @@ python3 -m tests.test_api                    # 接口端到端 + 冲突/原子�
 python3 -m tests.test_reclaim                # 部分回收端到端：跨记录/重写/冲突
 python3 -m tests.test_relocate               # 整批迁移：互换/链式/原地/重写/冲突/并发
 python3 -m tests.test_reservations_replace   # 保留区整体替换：规范化/冲突/并发
+python3 -m tests.test_versions               # 历史版本快照：基线/四类操作/404/不可变/旧库升级
 python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
 
@@ -361,7 +398,7 @@ python3 -m tests.test_concurrency            # 并发交错回归：快照读取
 app/
   allocator.py   # 区间运算 + 前缀树子集 DP 搜索算法（仅标准库）
   config.py      # 环境变量配置
-  db.py          # SQLite 建表、状态读取、BEGIN IMMEDIATE 原子提交
+  db.py          # SQLite 建表、状态读取、BEGIN IMMEDIATE 原子提交、版本快照
   main.py        # FastAPI 路由与请求/响应模型
 tests/
   test_allocator_bruteforce.py
@@ -370,6 +407,7 @@ tests/
   test_reclaim.py
   test_relocate.py
   test_reservations_replace.py
+  test_versions.py
   test_concurrency.py
 Dockerfile
 docker-compose.yml

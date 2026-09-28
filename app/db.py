@@ -15,6 +15,16 @@
   检查 + 覆盖/冲突复核 + 已分配集重写 + 版本自增”；迁移按整批同时
   迁移的语义释放全部来源、占用全部目标，目标可使用本批来源释放的
   地址，任何一步失败即整体回滚。
+
+历史版本
+========
+* 每次成功的写事务（分配提交 / 部分回收 / 整批迁移 / 保留区替换）在
+  **同一事务内**为自增后的新版本追加一份不可变快照（父网段、保留与
+  已分配 CIDR）；失败的操作整体回滚，不会留下任何版本快照；
+* 旧库**首次升级**（快照表尚不存在/为空）时，在初始化阶段给当前池
+  版本补存一份基线快照，此后该版本及后续版本均可查询；
+* 快照只追加、从不更新：旧版本的状态不随后续写入变化，查询时依据
+  快照内容重新计算该版本下的空闲 CIDR。
 """
 from __future__ import annotations
 
@@ -45,6 +55,25 @@ CREATE TABLE IF NOT EXISTS subnets (
     kind       TEXT NOT NULL CHECK (kind IN ('reserved', 'allocated')),
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- 历史版本快照：每次成功写事务为自增后的新版本追加一行 parent、一行
+-- 保留/已分配 CIDR 集合；只追加、从不更新，旧版本不随后续写入变化。
+CREATE TABLE IF NOT EXISTS pool_versions (
+    version    INTEGER PRIMARY KEY,
+    parent_cidr TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS pool_version_subnets (
+    version INTEGER NOT NULL,
+    cidr    TEXT NOT NULL,
+    kind    TEXT NOT NULL CHECK (kind IN ('reserved', 'allocated')),
+    PRIMARY KEY (version, cidr),
+    FOREIGN KEY (version) REFERENCES pool_versions (version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pool_version_subnets_version
+    ON pool_version_subnets (version);
 """
 
 
@@ -101,7 +130,13 @@ class Database:
             conn.close()
 
     def initialize(self) -> None:
-        """建表并在首次启动时写入父网段与保留子网（幂等）。"""
+        """建表并在首次启动时写入父网段与保留子网（幂等）。
+
+        旧库**首次升级**到带版本快照的结构时，``pool_versions`` 为空：
+        给当前池版本补存一份基线快照（父网段 + 当前保留/已分配 CIDR），
+        使当前版本及后续每个成功写入的版本都可查询。基线补存与首次建
+        池分别在独立事务内完成；进程在中途崩溃后重启会重新补存，幂等。
+        """
         import os
 
         directory = os.path.dirname(self._db_path)
@@ -124,7 +159,22 @@ class Database:
                     "INSERT OR IGNORE INTO subnets (cidr, kind) VALUES (?, 'reserved')",
                     [(str(net),) for net in reserved],
                 )
-            conn.commit()
+                conn.commit()
+                # 新建池：版本 1 即为基线版本，在同一初始化过程补存。
+                conn.execute("BEGIN")
+                state = self._load_state(conn)
+                self._insert_snapshot(conn, state)
+                conn.commit()
+            elif not conn.execute(
+                "SELECT 1 FROM pool_versions LIMIT 1"
+            ).fetchone():
+                # 旧库首次升级：快照表为空，给当前池版本补存基线。
+                # _load_state 要求调用方已开启事务；显式 BEGIN 使版本与
+                # 子网取自同一快照。
+                conn.execute("BEGIN")
+                state = self._load_state(conn)
+                self._insert_snapshot(conn, state)
+                conn.commit()
 
     # -- 读取 --------------------------------------------------------------
 
@@ -159,6 +209,31 @@ class Database:
         )
         return PoolState(parent, meta["version"], reserved, allocated)
 
+    @staticmethod
+    def _insert_snapshot(conn: sqlite3.Connection, state: PoolState) -> None:
+        """在**当前写事务内**为 ``state.version`` 追加一份不可变快照。
+
+        快照只追加：每个版本恰好一行 ``pool_versions`` 及其保留/已分配
+        CIDR 行。版本号主键冲突（同一版本重复快照）属于程序错误，直接
+        让 SQLite 抛出，由外层事务回滚。
+        """
+        conn.execute(
+            "INSERT INTO pool_versions (version, parent_cidr) VALUES (?, ?)",
+            (state.version, str(state.parent)),
+        )
+        conn.executemany(
+            "INSERT INTO pool_version_subnets (version, cidr, kind) "
+            "VALUES (?, ?, ?)",
+            [
+                (state.version, str(net), "reserved")
+                for net in state.reserved
+            ]
+            + [
+                (state.version, str(net), "allocated")
+                for net in state.allocated
+            ],
+        )
+
     def get_state(self) -> PoolState:
         """读取池状态。
 
@@ -171,6 +246,42 @@ class Database:
             state = self._load_state(conn, self._after_meta_select)
             conn.commit()
         return state
+
+    def get_state_version(self, version: int) -> PoolState | None:
+        """读取**历史版本**的不可变快照；未知版本返回 ``None``。
+
+        数据全部来自 ``pool_versions`` / ``pool_version_subnets`` 快照
+        表，与在线池状态（``pool_meta`` / ``subnets``）无关：后续写入只
+        追加新版本快照，从不修改旧版本行，因此旧快照不随后续写入变化。
+        父网段、保留与已分配 CIDR 在同一条读事务的快照内读取。
+        """
+        with self._conn() as conn:
+            conn.execute("BEGIN")
+            meta = conn.execute(
+                "SELECT parent_cidr FROM pool_versions WHERE version = ?",
+                (version,),
+            ).fetchone()
+            if meta is None:
+                conn.commit()
+                return None
+            rows = conn.execute(
+                "SELECT cidr, kind FROM pool_version_subnets "
+                "WHERE version = ? ORDER BY cidr",
+                (version,),
+            ).fetchall()
+            conn.commit()
+        parent = ipaddress.ip_network(meta["parent_cidr"], strict=True)
+        reserved = tuple(
+            ipaddress.ip_network(r["cidr"], strict=True)
+            for r in rows
+            if r["kind"] == "reserved"
+        )
+        allocated = tuple(
+            ipaddress.ip_network(r["cidr"], strict=True)
+            for r in rows
+            if r["kind"] == "allocated"
+        )
+        return PoolState(parent, version, reserved, allocated)
 
     # -- 原子提交 ----------------------------------------------------------
 
@@ -244,6 +355,9 @@ class Database:
                 # 在同一写事务内读取提交后的状态：版本与占用集必然对应
                 # 本次写入（其它提交被写锁挡在事务之外）。
                 state = self._load_state(conn)
+                # 与本次写入同一事务追加版本快照：提交失败（含快照写入
+                # 失败）时整体回滚，失败操作不生成任何版本。
+                self._insert_snapshot(conn, state)
                 conn.commit()
                 # 测试钩子：COMMIT 完成之后。修复前的实现会在此刻另开
                 # 连接读取状态，另一笔提交可能恰好落库；修复后结果已在
@@ -365,6 +479,9 @@ class Database:
                 )
                 # 与提交相同：在同一写事务内读取回收后的状态。
                 state = self._load_state(conn)
+                # 与本次写入同一事务追加版本快照：提交失败（含快照写入
+                # 失败）时整体回滚，失败操作不生成任何版本。
+                self._insert_snapshot(conn, state)
                 conn.commit()
                 self._after_commit(conn)
             except ConflictError:
@@ -523,6 +640,9 @@ class Database:
                 )
                 # 与提交/回收/替换相同：在同一写事务内读取迁移后的状态。
                 state = self._load_state(conn)
+                # 与本次写入同一事务追加版本快照：提交失败（含快照写入
+                # 失败）时整体回滚，失败操作不生成任何版本。
+                self._insert_snapshot(conn, state)
                 conn.commit()
                 self._after_commit(conn)
             except (ConflictError, RelocateInputError):
@@ -621,6 +741,9 @@ class Database:
                 )
                 # 与提交/回收相同：在同一写事务内读取替换后的状态。
                 state = self._load_state(conn)
+                # 与本次写入同一事务追加版本快照：提交失败（含快照写入
+                # 失败）时整体回滚，失败操作不生成任何版本。
+                self._insert_snapshot(conn, state)
                 conn.commit()
                 self._after_commit(conn)
             except (ConflictError, ReservationInputError):
