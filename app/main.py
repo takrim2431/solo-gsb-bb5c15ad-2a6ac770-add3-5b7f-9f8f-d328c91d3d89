@@ -279,6 +279,29 @@ def get_pool(db: Database = Depends(get_db)) -> PoolInfo:
     return _pool_info(db.get_state())
 
 
+@app.get(
+    "/api/pool/versions/{version}",
+    response_model=PoolInfo,
+    tags=["pool"],
+    responses={404: {"description": "未知版本（无对应历史快照）"}},
+)
+def get_pool_version(version: int, db: Database = Depends(get_db)) -> PoolInfo:
+    """返回指定历史版本的池状态与据此计算的空闲 CIDR。
+
+    数据来自该版本落库时固化的不可变快照（父网段、保留与已分配
+    CIDR），不随后续写入变化；空闲 CIDR 在读取时按快照内容重新计算。
+    数据库首次升级时为当前版本补存基线，此后每次成功的提交 / 回收 /
+    迁移 / 保留区替换都会在同一写事务内生成新版本快照；未知版本
+    （含失败操作未生成的版本号）返回 404。
+    """
+    state = db.get_version(version)
+    if state is None:
+        raise HTTPException(
+            status_code=404, detail=f"unknown pool version: {version}"
+        )
+    return _pool_info(state)
+
+
 @app.post(
     "/api/pool/reservations/replace",
     response_model=ReplaceReservationsResponse,

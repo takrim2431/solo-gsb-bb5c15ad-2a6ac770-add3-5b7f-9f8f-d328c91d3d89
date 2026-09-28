@@ -15,6 +15,8 @@
 
 整批迁移接口一次接收 **1～8 组 `from_cidr`/`to_cidr`**，把多段已分配地址**按整批同时迁移的结果**搬到新位置：两端必须是规范 CIDR、地址族与前缀长度相同，各来源之间、各目标之间不得重叠；每个来源必须被当前已分配地址完整覆盖，目标可使用本批来源释放的地址（支持两组目标互换、链式迁移、原地迁移），但不得触及保留区或未迁移的已分配地址。迁移后把剩余已分配地址与目标地址合并重写为最少的规范 CIDR，版本检查、覆盖与冲突复核、重写及版本自增在单个 SQLite 写事务内完成；输入非法返回 `422 Unprocessable Entity`，状态冲突返回 `409 Conflict` 且池与版本不变。
 
+每次提交、回收、迁移或保留区替换**成功**时，都会在同一个写事务内为新版本保存一份**不可变历史快照**（父网段、保留 CIDR、已分配 CIDR）；失败操作回滚，不产生版本。数据库首次升级时为当前池版本补存一份基线快照。通过 `GET /api/pool/versions/{version}` 可查询任意历史版本：返回该版本固化的状态与**据此快照重新计算**的空闲 CIDR，旧快照不随后续写入变化；未知版本返回 `404 Not Found`。
+
 ---
 
 ## 一条命令启动
@@ -26,7 +28,7 @@ docker compose up --build -d
 该命令会一次性完成：
 
 - 构建镜像并安装全部 Python 依赖；
-- 初始化 SQLite 数据库（建表、写入父网段与保留子网）；
+- 初始化 SQLite 数据库（建表、写入父网段与保留子网、保存版本 1 基线快照）；
 - 启动 API 服务。
 
 > 数据库与依赖初始化均随 `docker compose up --build` 自动完成，无需任何手动迁移步骤。数据持久化在命名卷 `cidr-data`（容器内 `/data`）。
@@ -71,8 +73,9 @@ docker compose down -v         # 同时删除数据卷（彻底重置）
 | --- | --- | --- |
 | GET | `/healthz` | 健康检查 |
 | GET | `/api/pool` | 查询池状态：父网段、版本、保留/已分配子网、当前空闲 CIDR |
+| GET | `/api/pool/versions/{version}` | **历史版本**：返回指定版本的不可变快照状态与据此计算的空闲 CIDR，未知版本 404 |
 | POST | `/api/allocations/preview` | **预演**：不修改状态，返回池版本与最优方案 |
-| POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库或返回 409 |
+| POST | `/api/allocations/commit` | **提交**：携带版本与方案，原子落库并生成新版本快照或返回 409 |
 | POST | `/api/allocations/reclaim` | **部分回收**：回收完全被已分配地址覆盖的规范 CIDR |
 | POST | `/api/allocations/relocate` | **整批迁移**：1～8 组 from/to，同时迁移多段已分配地址并合并重写 |
 | POST | `/api/pool/reservations/replace` | **替换保留区**：以目标集合整体重写保留子网（规范化为最少 CIDR） |
@@ -293,6 +296,40 @@ curl -X POST http://localhost:8000/api/pool/reservations/replace \
 
 输入非法时返回 `422 Unprocessable Entity`：CIDR 写法非规范（如主机位非零的 `10.0.0.1/24`）、无法解析、越出父网段（含父网段的超网）或地址族与父网段不一致。
 
+### 7. 查询历史版本（只读快照）
+
+每个池版本在生成时都会固化一份**不可变快照**：当时的父网段、保留 CIDR 与已分配 CIDR。按版本号查询即返回该版本的完整状态，并**依据快照内容**重新计算空闲 CIDR。
+
+```bash
+curl http://localhost:8000/api/pool/versions/3
+```
+
+成功（HTTP 200）响应体与 `GET /api/pool` 结构一致，但内容来自历史快照而非当前池：
+
+```json
+{
+  "parent_cidr": "10.0.0.0/8",
+  "version": 3,
+  "reserved_cidrs": ["10.0.0.0/16", "10.255.255.0/24"],
+  "allocated_cidrs": ["10.1.0.0/24", "10.1.1.0/24"],
+  "free_cidrs": ["..."],
+  "free_cidr_count": 3
+}
+```
+
+快照的生成时机与不变量：
+
+- **基线**：数据库首次升级（老数据卷启动新版本服务、历史版本表首次创建）时，在同一次初始化事务内为**当前**池版本补存一份基线快照；全新建库的基线即初始版本 1。更早的历史版本没有快照；
+- **提交 / 部分回收 / 整批迁移 / 保留区替换成功**：在各自写事务内、与状态改写同一事务写入新版本快照；操作失败（回滚，含 409/422）**不生成版本**，因此版本号可能出现空洞；
+- **不可变**：快照只写不改，后续任何写入都不影响旧快照；`free_cidrs` 虽在查询时计算，但输入完全来自固化快照，结果同样不随时间变化；
+- 查询在单条读事务内整行读取快照；版本号必须是整数，否则返回 `422 Unprocessable Entity`；**未知版本**（含尚未产生的版本、失败操作空出的版本号、基线之前的老版本）返回 `404 Not Found`：
+
+```json
+{ "detail": "unknown pool version: 99" }
+```
+
+> 历史版本仅记录可观测的池状态（父网段 / 保留 / 已分配 / 空闲 CIDR），不区分该版本由哪一种写操作产生。
+
 ---
 
 ## 正确性与并发保证
@@ -333,6 +370,12 @@ curl -X POST http://localhost:8000/api/pool/reservations/replace \
   互斥，同一版本并发写时**恰有一个**成功。迁移响应中的已分配/空闲 CIDR
   同样在本写事务内部读取，提交后的 `GET /api/pool` 与预演立即基于新版本
   与迁移后的占用集计算。
+- 历史版本快照随上述四类写操作在**同一写事务**内写入（版本检查、复核、
+  状态重写、版本自增与快照插入要么全部提交要么全部回滚），失败操作不会
+  留下版本；快照行只插入、从不更新或删除，因此旧版本状态不随后续写入
+  变化。历史版本查询整行读取快照并据此重新计算空闲 CIDR，与当前 `subnets`
+  表完全解耦。数据库首次升级时基线补存在初始化事务内完成，与建表、初始
+  池写入原子一致；重复初始化（重启）幂等，不会重复写入基线。
 
 ---
 
@@ -352,6 +395,7 @@ python3 -m tests.test_api                    # 接口端到端 + 冲突/原子�
 python3 -m tests.test_reclaim                # 部分回收端到端：跨记录/重写/冲突
 python3 -m tests.test_relocate               # 整批迁移：互换/链式/原地/重写/冲突/并发
 python3 -m tests.test_reservations_replace   # 保留区整体替换：规范化/冲突/并发
+python3 -m tests.test_versions               # 历史版本：基线补存/成功写出版/失败不出版/不可变/老库升级
 python3 -m tests.test_concurrency            # 并发交错回归：快照读取与提交响应绑定
 ```
 
@@ -361,7 +405,7 @@ python3 -m tests.test_concurrency            # 并发交错回归：快照读取
 app/
   allocator.py   # 区间运算 + 前缀树子集 DP 搜索算法（仅标准库）
   config.py      # 环境变量配置
-  db.py          # SQLite 建表、状态读取、BEGIN IMMEDIATE 原子提交
+  db.py          # SQLite 建表、状态读取、BEGIN IMMEDIATE 原子提交、历史版本快照
   main.py        # FastAPI 路由与请求/响应模型
 tests/
   test_allocator_bruteforce.py
@@ -370,6 +414,7 @@ tests/
   test_reclaim.py
   test_relocate.py
   test_reservations_replace.py
+  test_versions.py
   test_concurrency.py
 Dockerfile
 docker-compose.yml
